@@ -1,0 +1,16 @@
+# Proprietary/input and generated binaries
+*.apk
+*.apks
+*.aab
+*.jks
+*.keystore
+*.pem
+*.pk8
+
+# Local extracted APK and build outputs
+orig/
+patched_theme/
+_dumps/
+build/
+*.log
+*.tmp
