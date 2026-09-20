@@ -28,12 +28,16 @@ jobs:
         with:
           python-version: '3.x'
 
-      - name: Set up Android build tools
-        uses: android-actions/setup-android@v3
-        with:
-          packages: |
-            platform-tools
-            build-tools;35.0.0
+      - name: Locate preinstalled Android build tools
+        run: |
+          set -e
+          echo "ANDROID_HOME=$ANDROID_HOME"
+          TOOL_DIR="$(find "$ANDROID_HOME/build-tools" -type f -name apksigner -printf '%h\n' | sort -V | tail -n 1)"
+          test -n "$TOOL_DIR"
+          test -x "$TOOL_DIR/apksigner"
+          test -x "$TOOL_DIR/zipalign"
+          echo "$TOOL_DIR" >> "$GITHUB_PATH"
+          echo "Using $TOOL_DIR"
 
       - name: Download source APK
         env:
@@ -49,7 +53,6 @@ jobs:
 
       - name: Build and sign APK
         run: |
-          export PATH="$ANDROID_HOME/build-tools/35.0.0:$PATH"
           python3 tools/build_apk.py \
             --source source.apk \
             --output "${{ inputs.build_name }}" \
