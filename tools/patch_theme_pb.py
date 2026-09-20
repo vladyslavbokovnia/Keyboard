@@ -1,26 +1,30 @@
+#!/usr/bin/env python3
+"""Patch Gboard theme protobuf files without touching key colors."""
 from pathlib import Path
-import struct
+import argparse
 
-ROOT = Path('/home/ubuntu/gboard_patch/orig/assets/theme')
-OUT = Path('/home/ubuntu/gboard_patch/patched_theme')
-OUT.mkdir(parents=True, exist_ok=True)
-
-# Android/Gboard color literals are uint32 ARGB. Zero is fully transparent.
-TRANSPARENT = b'\x08\x00'
 
 def read_varint(data, pos):
-    start = pos
     value = 0
     shift = 0
     while pos < len(data):
-        b = data[pos]; pos += 1
-        value |= (b & 0x7f) << shift
+        b = data[pos]
+        pos += 1
+        value |= (b & 0x7F) << shift
         if not b & 0x80:
             return value, pos
         shift += 7
-        if shift > 70:
-            raise ValueError('bad varint')
-    raise ValueError('truncated varint')
+    raise ValueError("truncated varint")
+
+
+def varint(value):
+    out = bytearray()
+    while value >= 0x80:
+        out.append((value & 0x7F) | 0x80)
+        value >>= 7
+    out.append(value)
+    return bytes(out)
+
 
 def fields(data):
     pos = 0
@@ -28,6 +32,7 @@ def fields(data):
         start = pos
         tag, pos = read_varint(data, pos)
         num, wire = tag >> 3, tag & 7
+        payload = None
         if wire == 0:
             _, pos = read_varint(data, pos)
         elif wire == 1:
@@ -36,80 +41,120 @@ def fields(data):
             n, pos = read_varint(data, pos)
             payload_start = pos
             pos += n
-            if pos > len(data): raise ValueError('truncated bytes')
+            if pos > len(data):
+                raise ValueError("truncated length-delimited field")
+            payload = data[payload_start:pos]
         elif wire == 5:
             pos += 4
         else:
-            raise ValueError(f'unsupported wire {wire}')
-        yield start, pos, num, wire, data[payload_start:pos] if wire == 2 else None
+            raise ValueError(f"unsupported protobuf wire type {wire}")
+        yield start, pos, num, wire, payload
 
-def encode_len_field(num, payload):
-    return bytes([num << 3 | 2, len(payload)]) + payload
 
-def encode_literal(num, field_num):
-    # nested message: field 1 (uint32) = zero
-    nested = b'\x08' + TRANSPARENT[1:]
-    return encode_len_field(field_num, nested)
+def encode_len_field(field_num, payload):
+    return varint((field_num << 3) | 2) + varint(len(payload)) + payload
+
+
+def transparent_literal(field_num):
+    # Nested color literal: field 1 (uint32) = ARGB 0x00000000.
+    return encode_len_field(field_num, b"\x08\x00")
+
+
+BACKGROUND_NAMES = (
+    b"keyboard-body-area",
+    b"keyboard-base-area",
+    b"keyboard-header-area",
+    b"keyboard-background",
+    b"keyboard-clipboard-popup",
+    b"keyboard-clipboard-tooltip.panel",
+    b"keyboard-clipboard-item.panel",
+    b"clipboard-accessory-body-top-bar",
+    b"bg-clipboard-item-board-popup.panel",
+    b"expression-keyboard-background",
+    b"navbar.for-expression-footer.panel",
+    b"translate.queryholder.panel",
+    b"translate.language.panel.bg",
+    b"translate-keyboard-network-card.panel",
+)
+
+
+def is_background_rule(strings):
+    joined = b"\0".join(strings)
+    return any(name in joined for name in BACKGROUND_NAMES)
+
 
 def patch_message(msg, mode):
-    # mode=alias: a color alias definition has field 1=name and field 3=ref.
-    # mode=rule: a style rule has field 1=selector and field 4=ref.
     fs = list(fields(msg))
-    has_color_property = any(
-        n == 2 and w == 0 and read_varint(msg[start:end], 1)[0] == 1
-        for start, end, n, w, _ in fs
-    )
-    strings = [p for _, _, n, w, p in fs if w == 2]
-    joined = b'\0'.join(strings)
-    if mode == 'alias':
-        if not any(x in joined for x in (b'default_keyboard_background_primary_color', b'default_keyboard_background_secondary_color', b'default_keyboard_background_header_color')):
+    strings = [payload for _, _, _, wire, payload in fs if wire == 2 and payload is not None]
+    joined = b"\0".join(strings)
+    if mode == "alias":
+        if not any(x in joined for x in (
+            b"default_keyboard_background_primary_color",
+            b"default_keyboard_background_secondary_color",
+            b"default_keyboard_background_header_color",
+        )):
             return msg, False
         target_num = 3
     else:
-        if not any(x in joined for x in (b'keyboard-body-area', b'keyboard-base-area', b'keyboard-header-area', b'keyboard-background')):
+        if not is_background_rule(strings):
             return msg, False
-        target_num = 4
-    out = bytearray(); changed = False
-    for start, end, n, w, payload in fs:
+
+    has_color_property = any(
+        n == 2 and wire == 0 and read_varint(msg[start:end], 1)[0] == 1
+        for start, end, n, wire, _ in fs
+    )
+    out = bytearray()
+    changed = False
+    for start, end, n, wire, payload in fs:
         raw = msg[start:end]
-        if n == target_num and w == 2:
-            # Replace only string-reference field with a literal transparent color.
-            raw = encode_literal(3, target_num)
+        if mode == "alias" and n == 3 and wire == 2:
+            raw = transparent_literal(3)
             changed = True
-        elif mode == 'rule' and has_color_property and n == 3 and w == 2 and b'keyboard-' in joined:
-            # Direct ARGB background values used by legacy/overlay themes.
-            raw = encode_literal(3, 3)
+        elif mode == "rule" and n == 4 and wire == 2 and has_color_property:
+            raw = transparent_literal(4)
+            changed = True
+        elif mode == "rule" and n == 3 and wire == 2 and has_color_property:
+            # Direct ARGB color value used by legacy/overlay rules.
+            raw = transparent_literal(3)
             changed = True
         out += raw
     return bytes(out), changed
 
-report = []
-for src in sorted(ROOT.glob('*.binarypb')):
+
+def patch_file(src, dst):
     data = src.read_bytes()
-    changed = False
     out = bytearray()
-    try:
-        top = list(fields(data))
-        for start, end, n, w, payload in top:
-            raw = data[start:end]
-            if n == 2 and w == 2:
-                p1, c1 = patch_message(payload, 'alias')
-                p2, c2 = patch_message(p1, 'rule')
-                raw = encode_len_field(2, p2) if (c1 or c2) else raw
-                changed |= c1 or c2
-            elif n == 1 and w == 2:
-                p, c = patch_message(payload, 'rule')
-                raw = encode_len_field(1, p) if c else raw
-                changed |= c
-            out += raw
-    except Exception as e:
-        report.append(f'ERROR {src.name}: {e}')
-        continue
-    if changed:
-        (OUT / src.name).write_bytes(bytes(out))
-        report.append(f'PATCHED {src.name}')
-    else:
-        (OUT / src.name).write_bytes(data)
-report_path = OUT / 'PATCH_REPORT.txt'
-report_path.write_text('\n'.join(report) + '\n')
-print('\n'.join(report))
+    changed = False
+    for start, end, n, wire, payload in fields(data):
+        raw = data[start:end]
+        if wire == 2 and payload is not None and n in (1, 2):
+            mode = "alias" if n == 2 else "rule"
+            patched, did_change = patch_message(payload, mode)
+            if did_change:
+                raw = encode_len_field(n, patched)
+                changed = True
+        out += raw
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    dst.write_bytes(bytes(out))
+    return changed
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--input", type=Path, required=True, help="Extracted assets/theme directory")
+    ap.add_argument("--output", type=Path, required=True, help="Output patched assets/theme directory")
+    args = ap.parse_args()
+    report = []
+    for src in sorted(args.input.glob("*.binarypb")):
+        dst = args.output / src.name
+        try:
+            changed = patch_file(src, dst)
+            report.append(("PATCHED" if changed else "COPIED") + " " + src.name)
+        except Exception as exc:
+            report.append(f"ERROR {src.name}: {exc}")
+    (args.output / "PATCH_REPORT.txt").write_text("\n".join(report) + "\n")
+    print("\n".join(report))
+
+
+if __name__ == "__main__":
+    main()

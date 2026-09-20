@@ -1,0 +1,65 @@
+name: Build patched Gboard APK
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_apk_url:
+        description: Public URL of the source Gboard APK (APK or previously built APK)
+        required: true
+        type: string
+      build_name:
+        description: Output APK file name
+        required: false
+        default: Gboard-transparent-fixed.apk
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out patch project
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.x'
+
+      - name: Set up Android build tools
+        uses: android-actions/setup-android@v3
+
+      - name: Install Android build tools
+        run: sdkmanager "platform-tools" "build-tools;35.0.0"
+
+      - name: Download source APK
+        env:
+          SOURCE_APK_URL: ${{ inputs.source_apk_url }}
+        run: curl --fail --location --retry 3 --output source.apk "$SOURCE_APK_URL"
+
+      - name: Create ephemeral signing key
+        run: |
+          keytool -genkeypair -keystore build-key.jks \
+            -storepass android -keypass android -alias gboardpatch \
+            -keyalg RSA -keysize 2048 -validity 10000 \
+            -dname 'CN=Gboard Transparent Patch, O=Keyboard'
+
+      - name: Build and sign APK
+        run: |
+          export PATH="$ANDROID_HOME/build-tools/35.0.0:$PATH"
+          python3 tools/build_apk.py \
+            --source source.apk \
+            --output "${{ inputs.build_name }}" \
+            --keystore build-key.jks \
+            --storepass android \
+            --alias gboardpatch
+
+      - name: Upload APK artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: gboard-transparent-fixed
+          path: ${{ inputs.build_name }}
+          if-no-files-found: error
+          retention-days: 14
